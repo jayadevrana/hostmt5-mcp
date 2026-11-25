@@ -1,5 +1,7 @@
 # HostMT5 MCP server
 
+[![HostMT5 MCP server MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/jayadevrana/hostmt5-mcp/badges/score.svg)](https://glama.ai/mcp/servers/jayadevrana/hostmt5-mcp)
+
 An MCP server for **MetaTrader 5**. It lets Claude, ChatGPT desktop, Cursor and other MCP clients work with your MT5 accounts hosted on [HostMT5](https://hostmt5.com): read balances, positions and price history, place and manage orders, upload and attach Expert Advisors, and set up copy trading between accounts.
 
 HostMT5 runs a real MT5 terminal for each account in the cloud, so your EAs keep trading 24/7 and the assistant reaches the terminal over HTTPS. It works with any broker that offers MT5, demo or live. **HostMT5 is free during launch** (up to 3 MT5 accounts, no card).
