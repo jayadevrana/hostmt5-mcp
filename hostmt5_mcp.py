@@ -1,175 +1,107 @@
-"""HostMT5 MCP server: lets an AI assistant (Claude, ChatGPT desktop, Cursor, ...) work with your MetaTrader 5
-accounts hosted on https://hostmt5.com.
+"""HostMT5 MCP bridge: lets AI apps that run MCP servers locally over stdio (Claude Desktop, Cursor, Windsurf, Cline,
+LM Studio...) use the HostMT5 remote MCP server at https://hostmt5.com/mcp.
 
-Run:     uvx --from git+https://github.com/jayadevrana/hostmt5-mcp hostmt5-mcp
-Env:     HOSTMT5_KEY  (required, from the HostMT5 dashboard > API keys)
-         HOSTMT5_URL  (optional, default https://hostmt5.com)
-Everything the assistant does goes through the same checks as the website; orders are real on live accounts,
-so the tools that trade say so. Start on a demo account."""
-import base64, os
-from pathlib import Path
-import httpx
-from mcp.server.fastmcp import FastMCP
+Every message is forwarded to the remote server, so the tools are always HostMT5's current full set: accounts, live data
+and history, orders, Expert Advisors (write / upload / compile / attach / inputs / logs), stop and resume trading, copy
+trading, TradingView webhooks, alerts, statistics. Python 3.8+, standard library only.
 
-URL = os.environ.get('HOSTMT5_URL', 'https://hostmt5.com').rstrip('/')
-KEY = os.environ.get('HOSTMT5_KEY', '')
-mcp = FastMCP("hostmt5")
+Apps that take a URL do not need this: use https://hostmt5.com/mcp with header  Authorization: Bearer mc_...
 
+Run:  uvx --from git+https://github.com/jayadevrana/hostmt5-mcp hostmt5-mcp
+      or  python hostmt5_mcp.py
+Env:  HOSTMT5_KEY  (required for tools: Dashboard > AI & API > New API key; a read-only key shows only the read tools)
+      HOSTMT5_URL  (optional, default https://hostmt5.com)
 
-def _api(method, path, body=None):
-    if not KEY: raise RuntimeError('Set HOSTMT5_KEY (Dashboard > API keys)')
-    r = httpx.request(method, URL + path, json=body, headers={'Authorization': f'Bearer {KEY}'}, timeout=300)
-    try: j = r.json()
-    except Exception: j = {'detail': r.text[:300]}
-    if r.status_code >= 400: raise RuntimeError(j.get('detail') if isinstance(j, dict) else str(j))
-    return j
+Without a valid key the bridge still answers initialize and tools/list (from the public tool list at GET /mcp), so MCP
+clients and directories can inspect it; tool calls then return the key error."""
+import json, os, sys, urllib.error, urllib.request
 
-
-def _call(account_id, op, **kw):
-    r = _api('POST', f'/api/accounts/{account_id}/call', dict(op=op, **kw))
-    if r.get('ok') is False: raise RuntimeError(r.get('error') or f'{op} refused')
-    return r
+__version__ = '2.0.0'
+BASE = os.environ.get('HOSTMT5_URL', 'https://hostmt5.com').rstrip('/')
+URL = BASE + '/mcp'
+KEY = os.environ.get('HOSTMT5_KEY', '').strip()
+UA = 'hostmt5-mcp-bridge/' + __version__
+VERSIONS = ('2025-06-18', '2025-03-26', '2024-11-05')
+KEY_HELP = 'HostMT5 API key missing or invalid: set HOSTMT5_KEY (Dashboard > AI & API > New API key)'
+INSTRUCTIONS = ("HostMT5 hosts the user's real MetaTrader 5 terminals in the cloud. Call get_overview first: it lists the "
+                "accounts (use their id in every other tool). Orders on a live (real) account move real money: confirm size "
+                "and symbol with the user before trading unless they told you to act on your own.")
 
 
-# ---------------------------------------------------------------- overview
-@mcp.tool()
-def overview() -> dict:
-    """Plan (slots, paid until), every hosted MT5 account (id, label, login, server, status), copy-trading links and recent copy activity."""
-    me = _api('GET', '/api/me')
-    return {k: me[k] for k in ('plan', 'accounts', 'links', 'copylog', 'methods')}
+class NoKey(Exception):
+    pass
 
 
-@mcp.tool()
-def account_state(account_id: int) -> dict:
-    """Balance, equity, margin, open positions, pending orders and live Market Watch quotes of one account."""
-    return _api('GET', f'/api/accounts/{account_id}/state')
+def forward(raw):
+    """POST one JSON-RPC message to the remote server. Returns (status, body text). Raises NoKey on 401."""
+    if not KEY: raise NoKey()
+    req = urllib.request.Request(URL, data=raw.encode(), method='POST', headers={
+        'Authorization': 'Bearer ' + KEY, 'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream', 'User-Agent': UA})
+    try:
+        with urllib.request.urlopen(req, timeout=600) as r:
+            status, ctype, body = r.status, r.headers.get('Content-Type', ''), r.read().decode()
+    except urllib.error.HTTPError as e:
+        if e.code == 401: raise NoKey()
+        status, ctype, body = e.code, e.headers.get('Content-Type', ''), e.read().decode()
+    if 'text/event-stream' in ctype:                              # the server answers JSON today; accept SSE too
+        body = '\n'.join(l[5:].strip() for l in body.splitlines() if l.startswith('data:'))
+    return status, body
 
 
-@mcp.tool()
-def price_history(account_id: int, symbol: str, timeframe: str = 'H1', count: int = 200) -> dict:
-    """OHLC bars. timeframe: M1 M5 M15 M30 H1 H4 D1 W1 MN1. Each bar has time (unix), open, high, low, close, tick_volume, spread."""
-    return _call(account_id, 'bars', symbol=symbol, tf=timeframe, count=min(int(count), 5000))
+def public_tools():
+    """Tool names and descriptions from the public catalogue (GET /mcp), for clients without a valid key yet."""
+    req = urllib.request.Request(URL, headers={'Accept': 'application/json', 'User-Agent': UA})
+    with urllib.request.urlopen(req, timeout=30) as r: cat = json.loads(r.read().decode())
+    return [dict(name=t['name'], description=t['description'], inputSchema={'type': 'object'},
+                 annotations=dict(readOnlyHint=not t.get('trading'), openWorldHint=True)) for t in cat.get('tools', [])]
 
 
-@mcp.tool()
-def trade_history(account_id: int) -> dict:
-    """Closed deals of the last 30 days (deposits, opens, closes with profit)."""
-    return _call(account_id, 'deals')
+def offline(msg):
+    """Answer a request locally because there is no usable key. None = nothing to send (a notification)."""
+    mid, method, p = msg.get('id'), msg.get('method'), msg.get('params') or {}
+    if mid is None: return None
+    if method == 'initialize':
+        v = p.get('protocolVersion') if p.get('protocolVersion') in VERSIONS else VERSIONS[0]
+        res = dict(protocolVersion=v, capabilities=dict(tools=dict(listChanged=False)),
+                   serverInfo=dict(name='hostmt5', title='HostMT5', version=__version__), instructions=INSTRUCTIONS)
+    elif method == 'ping': res = {}
+    elif method == 'tools/list':
+        try: res = dict(tools=public_tools())
+        except Exception: res = dict(tools=[])
+    elif method == 'tools/call': res = dict(content=[dict(type='text', text=KEY_HELP)], isError=True)
+    elif method in ('resources/list', 'prompts/list'): res = {method.split('/')[0]: []}
+    else: return dict(jsonrpc='2.0', id=mid, error=dict(code=-32001, message=KEY_HELP))
+    return dict(jsonrpc='2.0', id=mid, result=res)
 
 
-@mcp.tool()
-def find_symbols(account_id: int, text: str) -> list:
-    """Search the broker's symbol list (name or description contains text). Use watch_symbol to get quotes for one."""
-    t = text.lower(); syms = _call(account_id, 'symbols').get('symbols', [])
-    return [s for s in syms if t in ' '.join(map(str, s if isinstance(s, list) else [s])).lower()][:50]
-
-
-@mcp.tool()
-def watch_symbol(account_id: int, symbol: str, show: bool = True) -> dict:
-    """Add (show=True) or remove a symbol from the account's Market Watch, so its quotes stream."""
-    return _call(account_id, 'show_symbol' if show else 'hide_symbol', symbol=symbol)
-
-
-# ---------------------------------------------------------------- trading (REAL orders on live accounts)
-@mcp.tool()
-def market_order(account_id: int, symbol: str, side: str, volume: float, sl: float = 0, tp: float = 0, comment: str = '') -> dict:
-    """Open a position at market. side: buy or sell. sl/tp are prices (0 = none). REAL order on a live account."""
-    return _call(account_id, 'market', symbol=symbol, side=side.lower(), volume=volume, sl=sl, tp=tp, comment=comment)
-
-
-@mcp.tool()
-def pending_order(account_id: int, symbol: str, kind: str, volume: float, price: float, sl: float = 0, tp: float = 0) -> dict:
-    """Place a pending order. kind: 'buy limit', 'sell limit', 'buy stop' or 'sell stop'. REAL order on a live account."""
-    return _call(account_id, 'pending', symbol=symbol, kind=kind.lower(), volume=volume, price=price, sl=sl, tp=tp)
-
-
-@mcp.tool()
-def close_position(account_id: int, ticket: int, volume: float = 0) -> dict:
-    """Close a position (volume 0 = all of it, or a partial volume)."""
-    return _call(account_id, 'close', ticket=ticket, **({'volume': volume} if volume else {}))
-
-
-@mcp.tool()
-def cancel_order(account_id: int, ticket: int) -> dict:
-    """Delete a pending order."""
-    return _call(account_id, 'cancel', ticket=ticket)
-
-
-@mcp.tool()
-def modify_position(account_id: int, ticket: int, sl: float = 0, tp: float = 0) -> dict:
-    """Set a position's stop loss and take profit (prices; 0 removes it)."""
-    return _call(account_id, 'modify', ticket=ticket, sl=sl, tp=tp)
-
-
-# ---------------------------------------------------------------- Expert Advisors (run 24/7 inside the account's MT5)
-@mcp.tool()
-def list_eas(account_id: int) -> dict:
-    """Compiled EAs available in the terminal, and the ones attached (with id, chart, default and changed inputs)."""
-    return _call(account_id, 'mt5_experts')
-
-
-@mcp.tool()
-def upload_ea(account_id: int, file_path: str) -> dict:
-    """Upload an EA from this computer: compiled .ex5, or .mq5 source (compiled on the server; errors come back). Then attach_ea."""
-    p = Path(file_path).expanduser()
-    return _call(account_id, 'mt5_upload', filename=p.name, data=base64.b64encode(p.read_bytes()).decode())
-
-
-@mcp.tool()
-def ea_inputs(account_id: int, name: str, symbol: str = 'EURUSD') -> dict:
-    """An EA's inputs and their defaults BEFORE attaching it (like MT5's Inputs tab). name as list_eas shows it."""
-    return _call(account_id, 'mt5_probe', name=name, symbol=symbol)
-
-
-@mcp.tool()
-def attach_ea(account_id: int, name: str, symbol: str, timeframe: str = 'H1', inputs: dict | None = None) -> dict:
-    """Attach an EA (name as list_eas shows it, e.g. 'Uploaded\\MyEA') to its own chart; it trades 24/7 and starts in ~1-2 s.
-    inputs: values that differ from the defaults, e.g. {"Lots": "0.05"} (names from ea_inputs)."""
-    return _call(account_id, 'mt5_attach', name=name, symbol=symbol, period=timeframe,
-                 **({'inputs': {k: str(v) for k, v in inputs.items()}} if inputs else {}))
-
-
-@mcp.tool()
-def set_ea_inputs(account_id: int, ea_id: str, inputs: dict) -> dict:
-    """Change an attached EA's inputs, e.g. {"Lots": "0.05"}. Names must be the EA's own (see list_eas). Only that EA restarts (~1 s)."""
-    return _call(account_id, 'mt5_inputs', eid=ea_id, inputs={k: str(v) for k, v in inputs.items()})
-
-
-@mcp.tool()
-def remove_ea(account_id: int, ea_id: str) -> dict:
-    """Detach one EA; the account's other EAs keep running."""
-    return _call(account_id, 'mt5_detach', eid=ea_id)
-
-
-# ---------------------------------------------------------------- copy trading
-@mcp.tool()
-def start_copying(master_account_id: int, follower_account_id: int, mode: str = 'multiplier', value: float = 1.0,
-                  max_lot: float = 0, reverse: bool = False) -> dict:
-    """Copy every new trade of the master to the follower. mode 'multiplier' (lot x value) or 'fixed' (value lots); max_lot caps it."""
-    return _api('POST', '/api/links', dict(master=master_account_id, follower=follower_account_id, mode=mode, value=value, max_lot=max_lot, reverse=reverse))
-
-
-@mcp.tool()
-def pause_copying(link_id: int, paused: bool = True) -> dict:
-    """Pause or resume one copy link (ids are in overview().links)."""
-    return _api('POST', f'/api/links/{link_id}', dict(active=not paused))
-
-
-@mcp.tool()
-def stop_copying(link_id: int) -> dict:
-    """Remove a copy link. Positions already copied stay open on the follower."""
-    return _api('DELETE', f'/api/links/{link_id}')
-
-
-# ---------------------------------------------------------------- accounts
-@mcp.tool()
-def account_power(account_id: int, on: bool) -> dict:
-    """Start or stop a hosted terminal (stopping pauses its EAs)."""
-    return _api('POST', f'/api/accounts/{account_id}/power', dict(on=on))
+def handle(line):
+    """One line from stdin -> the text to write back, or None."""
+    try: msg = json.loads(line)
+    except ValueError: return json.dumps(dict(jsonrpc='2.0', id=None, error=dict(code=-32700, message='Parse error')))
+    try:
+        status, body = forward(line)
+        return body.strip() if status != 202 and body.strip() else None   # 202 / empty = a notification was accepted
+    except NoKey:
+        if isinstance(msg, list):
+            out = [r for r in (offline(m) for m in msg if isinstance(m, dict)) if r is not None]
+            return json.dumps(out) if out else None
+        r = offline(msg) if isinstance(msg, dict) else None
+        return json.dumps(r) if r is not None else None
+    except Exception as e:
+        if not isinstance(msg, dict) or msg.get('id') is None: return None
+        return json.dumps(dict(jsonrpc='2.0', id=msg['id'], error=dict(code=-32000, message='HostMT5: %s' % e)))
 
 
 def main():
-    mcp.run()
+    for s in (sys.stdin, sys.stdout):                             # MCP stdio is UTF-8 with \n, also on Windows
+        try: s.reconfigure(encoding='utf-8', newline='\n')
+        except (AttributeError, ValueError): pass
+    for line in sys.stdin:
+        line = line.strip()
+        if not line: continue
+        out = handle(line)
+        if out: sys.stdout.write(out + '\n'); sys.stdout.flush()
 
 
 if __name__ == '__main__':
